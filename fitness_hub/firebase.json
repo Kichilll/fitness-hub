@@ -1,0 +1,40 @@
+{
+  "flutter": {
+    "platforms": {
+      "dart": {
+        "lib/firebase_options_dev.dart": {
+          "projectId": "fitness-hub-dev",
+          "configurations": {
+            "web": "1:983563452091:web:2f1baeb47932652aeaf39e"
+          }
+        },
+        "lib/firebase_options_prod.dart": {
+          "projectId": "fitness-hub-prod",
+          "configurations": {
+            "web": "1:888122954934:web:4d190ff2bdf2ff78a48217"
+          }
+        }
+      }
+    }
+  },
+  "hosting": {
+    "public": "build/web",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  },
+  "firestore": {
+    "database": "(default)",
+    "location": "eur3",
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  }
+}

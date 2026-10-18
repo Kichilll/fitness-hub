@@ -1,0 +1,94 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function isStaff() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && me().active == true
+        && me().role in ['organizer', 'treasurer'];
+    }
+    function isTreasurer() { return isStaff() && me().role == 'treasurer'; }
+    function isOrganizer() { return isStaff() && me().role == 'organizer'; }
+    function isFinanceRole() { return isTreasurer() || isOrganizer(); }
+
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if false;
+    }
+
+    match /settings/{doc} {
+      allow read: if isStaff();
+      allow write: if isOrganizer();
+    }
+
+    match /counters/{doc} {
+      allow read, write: if isStaff();
+    }
+
+    match /members/{id} {
+      allow read: if isStaff();
+      allow create, update: if isStaff();
+      allow delete: if false;
+    }
+
+    match /dues_periods/{id} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update, delete: if false;
+    }
+
+    match /member_dues/{id} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update, delete: if false;
+    }
+
+    match /payments/{id} {
+      allow read: if isStaff();
+      allow create: if isStaff()
+        && request.resource.data.recordedBy == request.auth.uid
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.method in ['momo', 'cash']
+        && (request.resource.data.method == 'cash'
+            ? request.resource.data.status in ['pending', 'verified']
+            : request.resource.data.status == 'pending');
+      allow update: if isTreasurer()
+        && resource.data.status == 'pending'
+        && request.resource.data.status in ['verified', 'rejected']
+        && request.resource.data.verifiedBy == request.auth.uid
+        && request.resource.data.amount == resource.data.amount;
+      allow delete: if false;
+    }
+
+    match /momo_references/{refKey} {
+      allow read: if isStaff();
+      allow create: if isStaff() && !exists(/databases/$(database)/documents/momo_references/$(refKey));
+      allow update, delete: if false;
+    }
+
+    match /payment_allocations/{id} {
+      allow read: if isStaff();
+      allow create: if isStaff();
+      allow update, delete: if false;
+    }
+
+    match /expenses/{id} {
+      allow read: if isStaff();
+      allow create: if isFinanceRole()
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0;
+      allow update: if isFinanceRole();
+      allow delete: if false;
+    }
+
+    match /audit_logs/{id} {
+      allow read: if isOrganizer() || isTreasurer();
+      allow create: if isStaff() && request.resource.data.actorId == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}
