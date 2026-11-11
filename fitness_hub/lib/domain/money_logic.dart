@@ -1,8 +1,9 @@
+library;
+
 /// Fitness Hub – Stage 2 money logic.
 ///
 /// Pure Dart: no Firebase, no Flutter. All amounts are integers in pesewas
 /// (GH₵30.00 = 3000) so we never get floating-point rounding errors.
-library money_logic;
 
 enum PaymentMethod { momo, cash }
 

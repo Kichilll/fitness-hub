@@ -2,92 +2,304 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // ================= helpers =================
     function signedIn() { return request.auth != null; }
-    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
     function isStaff() {
       return signedIn()
         && exists(/databases/$(database)/documents/users/$(request.auth.uid))
-        && me().active == true
-        && me().role in ['organizer', 'treasurer'];
+        && userDoc().active == true
+        && userDoc().role in ['organizer', 'treasurer'];
     }
-    function isTreasurer() { return isStaff() && me().role == 'treasurer'; }
-    function isOrganizer() { return isStaff() && me().role == 'organizer'; }
-    function isFinanceRole() { return isTreasurer() || isOrganizer(); }
+    function isTreasurer() { return isStaff() && userDoc().role == 'treasurer'; }
+    function isOrganizer() { return isStaff() && userDoc().role == 'organizer'; }
 
+    function isPosInt(v) { return v is int && v > 0; }
+    function isNonEmptyString(v) { return v is string && v.trim().size() > 0; }
+    function docPath(col, id) {
+      return /databases/$(database)/documents/$(col)/$(id);
+    }
+
+    // ================= users (role docs are set by hand in the console) =================
     match /users/{uid} {
       allow read: if signedIn() && request.auth.uid == uid;
       allow write: if false;
     }
 
-    match /settings/{doc} {
+    // ================= settings =================
+    match /settings/{name} {
       allow read: if isStaff();
-      allow write: if isOrganizer();
-    }
-
-    match /counters/{doc} {
-      allow read, write: if isStaff();
-    }
-
-    match /members/{id} {
-      allow read: if isStaff();
-      allow create, update: if isStaff();
+      allow create, update: if isOrganizer()
+        && (!('defaultFee' in request.resource.data)
+            || isPosInt(request.resource.data.defaultFee));
       allow delete: if false;
     }
 
-    match /dues_periods/{id} {
-      allow read: if isStaff();
-      allow create: if isStaff();
-      allow update, delete: if false;
-    }
-
-    match /member_dues/{id} {
-      allow read: if isStaff();
-      allow create: if isStaff();
-      allow update, delete: if false;
-    }
-
-    match /payments/{id} {
+    // ================= receipt counter =================
+    // counters/receipts { next: int }. Only ever goes up by exactly 1.
+    match /counters/{name} {
       allow read: if isStaff();
       allow create: if isStaff()
-        && request.resource.data.recordedBy == request.auth.uid
-        && request.resource.data.amount is number
-        && request.resource.data.amount > 0
-        && request.resource.data.method in ['momo', 'cash']
-        && (request.resource.data.method == 'cash'
-            ? request.resource.data.status in ['pending', 'verified']
-            : request.resource.data.status == 'pending');
-      allow update: if isTreasurer()
-        && resource.data.status == 'pending'
-        && request.resource.data.status in ['verified', 'rejected']
-        && request.resource.data.verifiedBy == request.auth.uid
-        && request.resource.data.amount == resource.data.amount;
+        && name == 'receipts'
+        && request.resource.data.keys().hasOnly(['next'])
+        && request.resource.data.next == 1;
+      allow update: if isStaff()
+        && request.resource.data.keys().hasOnly(['next'])
+        && request.resource.data.next == resource.data.next + 1;
       allow delete: if false;
     }
 
-    match /momo_references/{refKey} {
+    // ================= members (never deleted) =================
+    function validMember(d) {
+      return isNonEmptyString(d.name)
+        && d.phone is string
+        && d.phone.matches('^(0[0-9]{9}|\\+233[0-9]{9})$')
+        && d.status in ['active', 'paused', 'inactive'];
+    }
+    match /members/{id} {
       allow read: if isStaff();
-      allow create: if isStaff() && !exists(/databases/$(database)/documents/momo_references/$(refKey));
+      allow create, update: if isStaff() && validMember(request.resource.data);
+      allow delete: if false;
+    }
+
+    // ================= dues periods (frozen once created) =================
+    match /dues_periods/{period} {
+      allow read: if isStaff();
+      allow create: if isStaff()
+        && period.matches('^[0-9]{4}-(0[1-9]|1[0-2])$')
+        && request.resource.data.period == period
+        && isPosInt(request.resource.data.fee)
+        && request.resource.data.dueDate is timestamp;
       allow update, delete: if false;
     }
 
-    match /payment_allocations/{id} {
+    // ================= member dues =================
+    // Document ID = period_memberId, so a second record for the same
+    // member and month cannot exist.
+    function validNewDues(duesId, d) {
+      return d.period is string
+        && d.memberId is string
+        && duesId == d.period + '_' + d.memberId
+        && isPosInt(d.amount)
+        && d.amount == get(docPath('dues_periods', d.period)).data.fee
+        && d.dueDate is timestamp
+        && !('exemptReason' in d)
+        && get(docPath('members', d.memberId)).data.status == 'active';
+    }
+    // The only allowed edit: add an exemption reason, once.
+    function validExemption(a, b) {
+      return !('exemptReason' in b)
+        && isNonEmptyString(a.exemptReason)
+        && a.diff(b).affectedKeys().hasOnly(['exemptReason']);
+    }
+    match /member_dues/{duesId} {
       allow read: if isStaff();
-      allow create: if isStaff();
+      allow create: if isStaff() && validNewDues(duesId, request.resource.data);
+      allow update: if isStaff() && validExemption(request.resource.data, resource.data);
+      allow delete: if false;
+    }
+
+    // ================= payments =================
+    function paymentBaseOk(d) {
+      return d.recordedBy == request.auth.uid
+        && isPosInt(d.amount)
+        && d.method in ['momo', 'cash']
+        && d.memberId is string
+        && exists(docPath('members', d.memberId))
+        && d.createdAt == request.time
+        && d.allocatedTotal == 0
+        && d.refundedTotal == 0;
+    }
+    // Cash is verified on entry. Its receipt number must match the counter,
+    // and the counter must move up by 1 in the SAME batch.
+    function cashCreateOk(d) {
+      return d.method == 'cash'
+        && d.status == 'verified'
+        && d.verifiedBy == request.auth.uid
+        && d.verifiedAt == request.time
+        && d.receiptSeq is int
+        && d.receiptNo is string
+        && d.receiptNo.matches('^R-[0-9]{6}$')
+        && get(docPath('counters', 'receipts')).data.next == d.receiptSeq
+        && getAfter(docPath('counters', 'receipts')).data.next == d.receiptSeq + 1;
+    }
+    // MoMo starts pending, and its reference document must be written in the
+    // SAME batch. An already-used reference makes that write an update,
+    // which is denied, so the whole batch fails.
+    function momoCreateOk(paymentId, d) {
+      return d.method == 'momo'
+        && d.status == 'pending'
+        && d.reference is string
+        && d.reference.matches('^[A-Z0-9]{4,40}$')
+        && existsAfter(docPath('momo_references', d.reference))
+        && getAfter(docPath('momo_references', d.reference)).data.paymentId == paymentId;
+    }
+    // Treasurer decision on a MoMo claim (pending / needInfo flow).
+    function momoDecisionOk(a, b, changed) {
+      return isTreasurer()
+        && b.method == 'momo'
+        && changed.hasOnly(['status', 'verifiedBy', 'verifiedAt', 'decisionReason'])
+        && ((b.status == 'pending' && a.status in ['verified', 'rejected', 'needInfo'])
+            || (b.status == 'needInfo' && a.status in ['pending', 'verified', 'rejected']))
+        && (a.status == 'verified'
+            ? (a.verifiedBy == request.auth.uid && a.verifiedAt == request.time)
+            : (a.status == 'pending' || isNonEmptyString(a.decisionReason)));
+    }
+    // allocatedTotal moves up in the same batch as an allocation record.
+    function allocationBumpOk(a, b, changed) {
+      return changed.hasOnly(['allocatedTotal'])
+        && b.status == 'verified'
+        && a.allocatedTotal > b.allocatedTotal
+        && a.allocatedTotal + a.refundedTotal <= a.amount;
+    }
+    // refundedTotal moves up in the same batch as a refund correction.
+    function refundBumpOk(a, b, changed) {
+      return isTreasurer()
+        && changed.hasOnly(['refundedTotal'])
+        && b.status == 'verified'
+        && a.refundedTotal > b.refundedTotal
+        && a.allocatedTotal + a.refundedTotal <= a.amount;
+    }
+    function paymentUpdateOk(a, b) {
+      let changed = a.diff(b).affectedKeys();
+      return momoDecisionOk(a, b, changed)
+        || allocationBumpOk(a, b, changed)
+        || refundBumpOk(a, b, changed);
+    }
+    match /payments/{paymentId} {
+      allow read: if isStaff();
+      allow create: if isStaff()
+        && paymentBaseOk(request.resource.data)
+        && (cashCreateOk(request.resource.data)
+            || momoCreateOk(paymentId, request.resource.data));
+      allow update: if isStaff() && paymentUpdateOk(request.resource.data, resource.data);
+      allow delete: if false;
+    }
+
+    // ================= MoMo references (write-once) =================
+    match /momo_references/{ref} {
+      allow read: if isStaff();
+      allow create: if isStaff()
+        && ref.matches('^[A-Z0-9]{4,40}$')
+        && request.resource.data.keys().hasOnly(['paymentId', 'createdAt'])
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.paymentId is string
+        && getAfter(docPath('payments', request.resource.data.paymentId)).data.reference == ref;
       allow update, delete: if false;
     }
 
+    // ================= payment allocations (write-once) =================
+    // Document ID = paymentId_duesId. Written in the SAME batch as the
+    // payment's allocatedTotal increase by exactly this amount.
+    function allocationCreateOk(allocId, d) {
+      return d.paymentId is string
+        && d.duesId is string
+        && allocId == d.paymentId + '_' + d.duesId
+        && isPosInt(d.amount)
+        && d.amount <= get(docPath('member_dues', d.duesId)).data.amount
+        && !('exemptReason' in get(docPath('member_dues', d.duesId)).data)
+        && get(docPath('payments', d.paymentId)).data.status == 'verified'
+        && get(docPath('payments', d.paymentId)).data.memberId
+             == get(docPath('member_dues', d.duesId)).data.memberId
+        && !exists(docPath('corrections', 'undo_' + d.paymentId))
+        && getAfter(docPath('payments', d.paymentId)).data.allocatedTotal
+             == get(docPath('payments', d.paymentId)).data.allocatedTotal + d.amount
+        && getAfter(docPath('payments', d.paymentId)).data.allocatedTotal
+             + getAfter(docPath('payments', d.paymentId)).data.refundedTotal
+             <= get(docPath('payments', d.paymentId)).data.amount;
+    }
+    match /payment_allocations/{allocId} {
+      allow read: if isStaff();
+      allow create: if isStaff() && allocationCreateOk(allocId, request.resource.data);
+      allow update, delete: if false;
+    }
+
+    // ================= corrections (treasurer only, write-once) =================
+    // void / reversal: document ID is undo_<paymentId>, so a payment can be
+    //   voided or reversed only once. Blocked once any refund exists.
+    // refund: only from unallocated credit.
+    // Every correction needs an audit_logs/corr_<correctionId> in the same batch.
+    function correctionCommon(corrId, d) {
+      return d.byUid == request.auth.uid
+        && d.at == request.time
+        && isNonEmptyString(d.reason)
+        && d.type in ['voidEntry', 'reversal', 'refund']
+        && d.paymentId is string
+        && existsAfter(docPath('audit_logs', 'corr_' + corrId));
+    }
+    function undoOk(corrId, d) {
+      return (d.type == 'voidEntry' || d.type == 'reversal')
+        && corrId == 'undo_' + d.paymentId
+        && d.amount == 0
+        && get(docPath('payments', d.paymentId)).data.refundedTotal == 0
+        && (d.type == 'voidEntry'
+            || get(docPath('payments', d.paymentId)).data.status == 'verified');
+    }
+    function refundOk(corrId, d) {
+      return d.type == 'refund'
+        && !corrId.matches('^undo_.*')
+        && isPosInt(d.amount)
+        && get(docPath('payments', d.paymentId)).data.status == 'verified'
+        && !exists(docPath('corrections', 'undo_' + d.paymentId))
+        && getAfter(docPath('payments', d.paymentId)).data.refundedTotal
+             == get(docPath('payments', d.paymentId)).data.refundedTotal + d.amount
+        && getAfter(docPath('payments', d.paymentId)).data.allocatedTotal
+             + getAfter(docPath('payments', d.paymentId)).data.refundedTotal
+             <= get(docPath('payments', d.paymentId)).data.amount;
+    }
+    match /corrections/{corrId} {
+      allow read: if isStaff();
+      allow create: if isTreasurer()
+        && correctionCommon(corrId, request.resource.data)
+        && (undoOk(corrId, request.resource.data)
+            || refundOk(corrId, request.resource.data));
+      allow update, delete: if false;
+    }
+
+    // ================= expenses =================
+    // draft -> submitted -> approved -> paid, or rejected (with a reason).
+    // Any staff may move an expense along (agreed decision for v1).
+    function expenseStepOk(cur, nxt) {
+      return (cur == 'draft' && nxt == 'submitted')
+        || (cur == 'submitted' && nxt in ['approved', 'rejected'])
+        || (cur == 'approved' && nxt in ['paid', 'rejected']);
+    }
+    function expenseCreateOk(d) {
+      return isPosInt(d.amount)
+        && d.status == 'draft'
+        && d.refunded == 0
+        && isNonEmptyString(d.title)
+        && isNonEmptyString(d.category)
+        && d.recordedBy == request.auth.uid
+        && d.createdAt == request.time;
+    }
+    function expenseUpdateOk(a, b) {
+      let changed = a.diff(b).affectedKeys();
+      return (changed.hasOnly(['status', 'decisionReason', 'lastActionBy', 'lastActionAt'])
+              && changed.hasAll(['status', 'lastActionBy', 'lastActionAt'])
+              && expenseStepOk(b.status, a.status)
+              && a.lastActionBy == request.auth.uid
+              && a.lastActionAt == request.time
+              && (a.status != 'rejected' || isNonEmptyString(a.decisionReason)));
+    }
     match /expenses/{id} {
       allow read: if isStaff();
-      allow create: if isFinanceRole()
-        && request.resource.data.amount is number
-        && request.resource.data.amount > 0;
-      allow update: if isFinanceRole();
+      allow create: if isStaff() && expenseCreateOk(request.resource.data);
+      allow update: if isStaff() && expenseUpdateOk(request.resource.data, resource.data);
       allow delete: if false;
     }
 
+    // ================= audit log (append-only) =================
     match /audit_logs/{id} {
-      allow read: if isOrganizer() || isTreasurer();
-      allow create: if isStaff() && request.resource.data.actorId == request.auth.uid;
+      allow read: if isStaff();
+      allow create: if isStaff()
+        && request.resource.data.byUid == request.auth.uid
+        && request.resource.data.at == request.time
+        && isNonEmptyString(request.resource.data.action)
+        && request.resource.data.targetId is string
+        && request.resource.data.reason is string;
       allow update, delete: if false;
     }
   }

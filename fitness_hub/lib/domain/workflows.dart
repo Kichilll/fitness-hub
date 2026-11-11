@@ -1,6 +1,7 @@
+library;
+
 /// Fitness Hub – Stage 2 workflows: MoMo, cash, expenses, corrections.
 /// Pure Dart. Every action that touches money returns an [AuditEntry].
-library workflows;
 
 import 'money_logic.dart';
 

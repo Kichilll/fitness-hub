@@ -1,6 +1,5 @@
+import 'package:fitness_hub/domain/money_logic.dart';
 import 'package:test/test.dart';
-
-import '../lib/domain/money_logic.dart';
 
 Dues d(String period, {int amount = 3000, String? exemptReason}) => Dues(
   id: duesId(period, 'm1'),
